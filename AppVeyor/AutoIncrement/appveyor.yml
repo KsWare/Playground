@@ -1,0 +1,74 @@
+version: 0.1.{build}+{branch}
+branches:
+  only:
+  - appveyor-autoincrement
+skip_tags: true
+image: Visual Studio 2017
+init:
+- ps: echo "--- Init script ---"
+- ps: >
+    $meta= Get-Date -Format "yyyyMMddHHmmss"
+
+    Update-AppveyorBuild -Version "$Env:build_version.$($Env:APPVEYOR_BUILD_NUMBER)+appveyor-autoincrement+$meta"
+- ps: >
+    if ($env:APPVEYOR_REPO_COMMIT_MESSAGE -eq '.') { $env:skip_nuget = "true" } else { $env:skip_nuget = "false" }
+
+    echo "skip_nuget: $env:skip_nuget"
+- ps: >
+    $apiUrl = 'https://ci.appveyor.com/api'
+
+    $headers = @{
+      "Authorization" = "Bearer $env:appveyor_api_token"
+      "Content-type" = "application/json"
+      "Accept" = "application/json"
+    }
+environment:
+  github_access_token_appveyor:
+    secure: 9Z+iJbAt3SVWp4/F34xGQ1iDUf1XIdshovPwK3wMQf8B8wI+o2XyFsg8NmJlsYkl
+  github_user_email_appveyor: appveyor@ksware.de
+  github_user_name_appveyor: Appveyor-KsWare
+  VersionFile: AppVeyor\AutoIncrement\version.txt
+  appveyor_api_token:
+    secure: oQfwMIrZtGifKKK0yBmVOnRzZsq+DO8kyGreySRXUUI=
+install:
+- ps: echo "--- Install script ---"
+- ps: >
+    $response = Invoke-RestMethod -Method Get -Uri "$apiUrl/projects/$env:APPVEYOR_ACCOUNT_NAME/$env:APPVEYOR_PROJECT_SLUG/history?recordsNumber=100" -Headers $headers
+
+    $lastBuildVersion = $response.builds | select -skip 1 -first 1 @{Label="MajorVersion"; Expression={$_.version.Split('.')[0]}}, @{Label="MinorVersion"; Expression={$_.version.Split('.')[1]}}, @{Label="BuildVersion"; Expression={$_.version.Split('.')[2]}}
+
+    $lastVersionText=$response.builds[1].version
+
+    echo "Last version: $lastVersionText"
+- ps: "$versiontxt=Get-Content -path \"$env:VersionFile\"\nif($versiontxt[1] -eq \"reset\") { \n    $env:version=$versiontxt[0]\n    echo \"New version: $env:version\"    \n    echo \"Reset build number requested\"\n    Update-AppveyorBuild -Version \"$env:version.0+AppVeyor-AutoIncrement+$meta\"\n    $reset_build=\"true\"\n    New-Item -Name \"$env:VersionFile\" -ItemType File -Force\n    Add-Content \"$env:VersionFile\" \"$env:version\"\n} else {\n    $env:version=$versiontxt\n    echo \"New version: $env:version\"    \n    Update-AppveyorBuild -Version \"$env:version.$env:APPVEYOR_BUILD_NUMBER+AppVeyor-AutoIncrement+$meta\"\n}\n"
+- ps: "if($reset_build -eq \"true\") {\n    $build = @{\n      nextBuildNumber = 1\n    }\n    $json = $build | ConvertTo-Json    \n    echo \"Invoke 'Reset Build Nummer'\"\n    Invoke-RestMethod -Method Put \"$apiUrl/projects/$env:APPVEYOR_ACCOUNT_NAME/$env:APPVEYOR_PROJECT_SLUG/settings/build-number\" -Body $json -Headers $headers\n}\n"
+build: off
+test: off
+before_deploy:
+- ps: >-
+    echo "--- Before deployment script ---"
+
+    echo "skip_nuget: $env:skip_nuget"
+deploy:
+- provider: Webhook
+  url: http://ksware.de/?nuget&skip_nuget=$env:skip_nuget
+  authorization:
+    secure: BCdIqodUVBw7EBWPFyXrFQ==
+  on:
+    skip_nuget: false
+on_success:
+- echo "--- On build success script ---"
+- git config --global credential.helper store
+- ps: Add-Content "$env:USERPROFILE\\.git-credentials" "https://$($env:github_access_token_appveyor):x-oauth-basic@github.com`n"
+- git config --global user.email "%github_user_email_appveyor%"
+- git config --global user.name "%github_user_name_appveyor%"
+- git checkout appveyor-autoincrement
+- ps: Out-File "$env:APPVEYOR_BUILD_FOLDER\\AppVeyor\\AutoIncrement\\.appveyor.version"
+- ps: Add-Content "$env:APPVEYOR_BUILD_FOLDER\\AppVeyor\\AutoIncrement\\.appveyor.version" "$Env:APPVEYOR_BUILD_VERSION"
+- git add .
+- git commit -v -a -m "[skip ci] increment version %APPVEYOR_BUILD_VERSION%"
+- git push
+on_failure:
+- ps: echo "--- On build error script ---"
+on_finish:
+- ps: echo "--- On build finsish script ---"
