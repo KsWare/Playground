@@ -1,4 +1,4 @@
-version: 0.1.{build}+{branch}
+version: 0.2.{build}+{branch}
 branches:
   only:
   - appveyor-autoincrement
@@ -9,10 +9,10 @@ init:
 - ps: >
     $meta= Get-Date -Format "yyyyMMddHHmmss"
 
-    Update-AppveyorBuild -Version "$Env:build_version.$($Env:APPVEYOR_BUILD_NUMBER)+appveyor-autoincrement+$meta"
-- ps: >
+    Update-AppveyorBuild -Version "$ENV:APPVEYOR_BUILD_VERSION+$meta"
+- ps: |
+    # Parse commit message
     if ($env:APPVEYOR_REPO_COMMIT_MESSAGE -eq '.') { $env:skip_nuget = "true" } else { $env:skip_nuget = "false" }
-
     echo "skip_nuget: $env:skip_nuget"
 - ps: >
     $apiUrl = 'https://ci.appveyor.com/api'
@@ -28,20 +28,81 @@ environment:
   github_user_email_appveyor: appveyor@ksware.de
   github_user_name_appveyor: Appveyor-KsWare
   VersionFile: AppVeyor\AutoIncrement\version.txt
+  CommitVersionFile: AppVeyor\AutoIncrement\.appveyor.version
   appveyor_api_token:
     secure: oQfwMIrZtGifKKK0yBmVOnRzZsq+DO8kyGreySRXUUI=
 install:
 - ps: echo "--- Install script ---"
-- ps: >
-    $response = Invoke-RestMethod -Method Get -Uri "$apiUrl/projects/$env:APPVEYOR_ACCOUNT_NAME/$env:APPVEYOR_PROJECT_SLUG/history?recordsNumber=100" -Headers $headers
-
-    $lastBuildVersion = $response.builds | select -skip 1 -first 1 @{Label="MajorVersion"; Expression={$_.version.Split('.')[0]}}, @{Label="MinorVersion"; Expression={$_.version.Split('.')[1]}}, @{Label="BuildVersion"; Expression={$_.version.Split('.')[2]}}
-
-    $lastVersionText=$response.builds[1].version
-
-    echo "Last version: $lastVersionText"
-- ps: "$versiontxt=Get-Content -path \"$env:VersionFile\"\nif($versiontxt[1] -eq \"reset\") { \n    $env:version=$versiontxt[0]\n    echo \"New version: $env:version\"    \n    echo \"Reset build number requested\"\n    Update-AppveyorBuild -Version \"$env:version.0+AppVeyor-AutoIncrement+$meta\"\n    $reset_build=\"true\"\n    New-Item -Name \"$env:VersionFile\" -ItemType File -Force\n    Add-Content \"$env:VersionFile\" \"$env:version\"\n} else {\n    $env:version=$versiontxt\n    echo \"New version: $env:version\"    \n    Update-AppveyorBuild -Version \"$env:version.$env:APPVEYOR_BUILD_NUMBER+AppVeyor-AutoIncrement+$meta\"\n}\n"
-- ps: "if($reset_build -eq \"true\") {\n    $build = @{\n      nextBuildNumber = 1\n    }\n    $json = $build | ConvertTo-Json    \n    echo \"Invoke 'Reset Build Nummer'\"\n    Invoke-RestMethod -Method Put \"$apiUrl/projects/$env:APPVEYOR_ACCOUNT_NAME/$env:APPVEYOR_PROJECT_SLUG/settings/build-number\" -Body $json -Headers $headers\n}\n"
+- git config --global credential.helper store
+- ps: Add-Content "$env:USERPROFILE\\.git-credentials" "https://$($env:github_access_token_appveyor):x-oauth-basic@github.com`n"
+- git config --global user.email "%github_user_email_appveyor%"
+- git config --global user.name "%github_user_name_appveyor%"
+- git checkout %APPVEYOR_REPO_BRANCH%
+- ps: |
+    # Get project settings
+    $response = Invoke-RestMethod -Method Get -Uri "$apiUrl/projects/$env:APPVEYOR_ACCOUNT_NAME/$env:APPVEYOR_PROJECT_SLUG/settings" -Headers $headers
+    $settings = $response.settings
+- ps: |
+    #Extract version format
+    $versionFormat = $settings.versionFormat
+    echo "versionFormat: $versionFormat"
+    if(-not ($versionFormat -match "^(\d+\.\d+)(\..*)$")) {
+        $env:APPVEYOR_SKIP_FINALIZE_ON_EXIT="true"
+        Write-Error -Message "`nERROR: Unsupported version format!" -ErrorAction Stop
+        Exit-AppveyorBuild
+    }
+    $currentVersion = $Matches[1]
+    $currentVersionSegments = $currentVersion.Split(".")
+    echo "Current version: ""$currentVersion.*"" / $($currentVersionSegments.Count+1) parts"
+- ps: |
+    # Get new version
+    $versiontxt=Get-Content -path "$env:VersionFile" -TotalCount 1
+    if(-not ($versiontxt -match "^\d+\.\d+$")) {
+        $env:APPVEYOR_SKIP_FINALIZE_ON_EXIT="true"
+        Write-Error -Message "`nERROR: Unsupported version format!" -ErrorAction Stop
+        Exit-AppveyorBuild
+    }
+    $newVersionSegments = $versiontxt.Split(".")
+    echo "New version: ""$versiontxt.*"" / $($newVersionSegments.Count+1) parts"
+    $buildVersion = $versiontxt
+- ps: |
+    # Compare last version with new version
+    $reset_build = "false"  
+    $buildNumber = $Env:APPVEYOR_BUILD_NUMBER
+    if ($currentVersionSegments[0] -ne $newVersionSegments[0]) {
+        $reset_build="true"
+        $buildNumber=0
+    } elseif ($currentVersionSegments[1] -ne $newVersionSegments[1]) {
+        $reset_build="true"
+        $buildNumber=0
+    }
+    echo "Reset build number: $reset_build"
+- ps: |
+    # Extract ChangeLog
+    $changeLog=Get-Content -path "$env:VersionFile" | select -Skip 1
+    echo "ChangeLog:`n$changeLog"
+- ps: |
+    # Conditional update settings
+    if($reset_build -eq "true") {
+        $b=$versionFormat -match "^(\d+\.\d+)\.(.*)$"
+        $settings.versionFormat = "$buildVersion.$($Matches[2])"
+        echo "versionFormat: $($settings.versionFormat)"
+        $body = ConvertTo-Json -Depth 10 -InputObject $settings
+        $response = Invoke-RestMethod -Method Put -Uri "$apiUrl/projects" -Headers $headers -Body $body
+    }
+- ps: |
+    # Conditional Send BuildNumber = 1
+    if($reset_build -eq "true") {
+        $build = @{
+          nextBuildNumber = 1
+        }
+        $json = $build | ConvertTo-Json    
+        echo "Invoke 'Reset Build Nummer'"
+        Invoke-RestMethod -Method Put "$apiUrl/projects/$env:APPVEYOR_ACCOUNT_NAME/$env:APPVEYOR_PROJECT_SLUG/settings/build-number" -Body $json -Headers $headers
+    }
+- ps: |
+    # set current build version
+    Update-AppveyorBuild -Version "$buildVersion.$buildNumber+$meta"    
 build: off
 test: off
 before_deploy:
@@ -58,13 +119,8 @@ deploy:
     skip_nuget: false
 on_success:
 - echo "--- On build success script ---"
-- git config --global credential.helper store
-- ps: Add-Content "$env:USERPROFILE\\.git-credentials" "https://$($env:github_access_token_appveyor):x-oauth-basic@github.com`n"
-- git config --global user.email "%github_user_email_appveyor%"
-- git config --global user.name "%github_user_name_appveyor%"
-- git checkout appveyor-autoincrement
-- ps: Out-File "$env:APPVEYOR_BUILD_FOLDER\\AppVeyor\\AutoIncrement\\.appveyor.version"
-- ps: Add-Content "$env:APPVEYOR_BUILD_FOLDER\\AppVeyor\\AutoIncrement\\.appveyor.version" "$Env:APPVEYOR_BUILD_VERSION"
+- ps: Out-File "$env:APPVEYOR_BUILD_FOLDER\\$env:CommitVersionFile"
+- ps: Add-Content "$env:APPVEYOR_BUILD_FOLDER\\$env:CommitVersionFile" "$Env:APPVEYOR_BUILD_VERSION"
 - git add .
 - git commit -v -a -m "[skip ci] increment version %APPVEYOR_BUILD_VERSION%"
 - git push
